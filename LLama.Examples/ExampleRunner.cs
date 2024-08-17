@@ -32,6 +32,7 @@ public class ExampleRunner
         { "Batched Executor: Fork", BatchedExecutorFork.Run },
         { "Batched Executor: Rewind", BatchedExecutorRewind.Run },
         { "Batched Executor: Guidance", BatchedExecutorGuidance.Run },
+        { "Batched Executor: Multi", BatchedExecutorMultiGuidance.Run },
         { "Batched Executor: LLava", BatchedExecutorLLava.Run },
         { "Batched Executor: BoolQ Benchmark", BatchedExecutorBoolQ.Run },
         { "Batched Executor: Beam Search", BatchedExecutorBeamSearch.Run },

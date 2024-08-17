@@ -12,6 +12,9 @@
 	  <LangVersion>12</LangVersion>
 	<NoWarn>1701;1702;8604;SKEXP0001;SKEXP0050;SKEXP0052;SKEXP0003</NoWarn>
   </PropertyGroup>
+  <ItemGroup>
+    <Compile Remove="Examples\BatchedExecutorMultiGuidance.cs" />
+  </ItemGroup>
 
   <ItemGroup>
     <PackageReference Include="Microsoft.Extensions.Logging.Console" Version="8.0.0" />
