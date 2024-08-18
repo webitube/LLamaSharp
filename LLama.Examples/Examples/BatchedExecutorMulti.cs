@@ -18,12 +18,40 @@ public class BatchedExecutorMultiGuidance
     /// </summary>
     private const int TokenCount = 200;
 
+    private const int MAX_CONVERSATION_TOKEN_COUNT = 200;
+    private const int MAX_BATCH_TOKEN_COUNT = 10000;
+
     private const int NUM_BATCHED_CONVERSATIONS = 64;
 
-    private static async Task<DecodeResult> Infer(BatchedExecutor executor)
+    private static bool TotalBatchTokensReached => (BatchTokenCount >= MAX_BATCH_TOKEN_COUNT);
+    private static int BatchTokenCount { get; set; }
+
+    private const DecodeResult DEFAULT_INFERENCE_RESULT = DecodeResult.Ok;
+    private static DecodeResult InferenceDecodeResult { get; set; } = DEFAULT_INFERENCE_RESULT;
+    private static bool InferenceDecodeErrorFound => InferenceDecodeResult != DecodeResult.Ok;
+
+    public enum InferenceStatus
     {
-        return await executor.Infer();
-	}
+        InProgress,
+        Complete,
+
+        Error,
+        MaxConversationTokensReached
+    }
+
+    public class InferenceResultData(int id, string userMsg, Conversation conversation, BaseSamplingPipeline samplingPipeline, StreamingTokenDecoder streamingTokenDecoder)
+    {
+        public int Id { get; set; } = id;
+        public InferenceStatus Status { get; set; } = InferenceStatus.InProgress;
+        public int NumTokens { get; set; } = 0;
+        public DecodeResult KvCacheResult { get; set; } = DecodeResult.Ok;
+        public string UserMsg { get; set; } = userMsg;
+        public string Response { get; set; } = string.Empty;
+
+        public Conversation Conversation { get; set; } = conversation;
+        public BaseSamplingPipeline SamplingPipeline { get; set; } = samplingPipeline;
+        public StreamingTokenDecoder StreamingTokenDecoder { get; set; } = streamingTokenDecoder;
+    }
 
     public static async Task Run()
     {
@@ -47,11 +75,14 @@ public class BatchedExecutorMultiGuidance
         Console.WriteLine($"Created executor with model: {name}");
 
         // Load the two prompts into two conversations
-        var guided = new List<Conversation>();
-        var guidedSampler = new List<DefaultSamplingPipeline>();
-        var guidedDecoder = new List<StreamingTokenDecoder>();
-        var guidedInProgress = new HashSet<int>();
-        var guidedNumTokens = new List<int>();
+        //var guided = new List<Conversation>();
+        //var guidedSampler = new List<DefaultSamplingPipeline>();
+        //var guidedDecoder = new List<StreamingTokenDecoder>();
+        //var guidedInProgress = new HashSet<int>();
+        //var guidedNumTokens = new List<int>();
+
+        //var activeConversations = new Queue<InferenceResultData>();
+        var mapConversationIdToInferenceData = new Dictionary<int, InferenceResultData>();
 
         for (var index = 0; index < NUM_BATCHED_CONVERSATIONS; index++)
         {
@@ -59,19 +90,16 @@ public class BatchedExecutorMultiGuidance
             var currPrompt = questions[promptIndex];
 
             var currGuided = executor.Create();
-            guided.Add(currGuided);
             currGuided.Prompt(executor.Context.Tokenize(currPrompt));
 
-            //guidedSampler.Add(new GuidedSampler(currGuided, weight));
-            guidedSampler.Add(new DefaultSamplingPipeline());
-            guidedDecoder.Add(new StreamingTokenDecoder(executor.Context));
+            var samplingPipeline = new DefaultSamplingPipeline();
+            var streamingTokenDecoder = new StreamingTokenDecoder(executor.Context);
 
             // Initialize the conversations that are active and the number of tokens they've received.
-            guidedInProgress.Add(index);
-            guidedNumTokens.Add(0);
+            mapConversationIdToInferenceData.Add(index, new(index, currPrompt, currGuided, samplingPipeline, streamingTokenDecoder));
         }
 
-        var tokenCount = NUM_BATCHED_CONVERSATIONS; // guided and unguided.
+        BatchTokenCount = 0; // guided and unguided.
         var timer = Stopwatch.StartNew();
         var decodeResult = DecodeResult.Ok;
         var errors = new List<string>();
@@ -82,63 +110,73 @@ public class BatchedExecutorMultiGuidance
            .StartAsync(async progress =>
             {
                 var reporter = progress.AddTask("Running Inference", maxValue: TokenCount);
-                for (var tokenIndex = 0; (tokenIndex < TokenCount); tokenIndex++)
+                for (var tokenIndex = 0; (tokenIndex < TokenCount) && !TotalBatchTokensReached && (errors.Count == 0); tokenIndex++)
                 {
-                    if (guidedInProgress.Count == 0)
-                    {
-                        break;
-                    }
-
-                    for(var conversationIndex =  0; (conversationIndex < NUM_BATCHED_CONVERSATIONS); conversationIndex++)
+                    for(var conversationIndex =  0; (conversationIndex < NUM_BATCHED_CONVERSATIONS) && !InferenceDecodeErrorFound && !TotalBatchTokensReached; conversationIndex++)
                     {
                         try
                         {
-                            if (!guidedInProgress.Contains(conversationIndex))
+                            var currStatus = mapConversationIdToInferenceData[conversationIndex];
+                            if (currStatus.Status != InferenceStatus.InProgress)
                             {
                                 continue;
                             }
 
-                            var currGuided = guided[conversationIndex];
-                            var currGuidedSampler = guidedSampler[conversationIndex];
-                            var currGuidedDecoder = guidedDecoder[conversationIndex];
+                            var currGuided = currStatus.Conversation;
+                            var currGuidedSampler = currStatus.SamplingPipeline as DefaultSamplingPipeline;
+                            var currGuidedDecoder = currStatus.StreamingTokenDecoder;
 
+                            if ((currGuided == null) || (currGuidedSampler == null) || (currGuidedDecoder == null))
+                            {
+                                errors.Add($"currGuided={currGuided}, currGuidedSampler={currGuidedSampler}, currGuidedDecoder={currGuidedDecoder}");
+                                break;
+                            }
+
+                            // Try to infer on the current conversation. If an error occurs (likely NoKvSlot), set the current
+                            // conversations error status and code and abort.
                             if (currGuided.RequiresInference)
                             {
                                 decodeResult = await executor.Infer();
                                 if (decodeResult != DecodeResult.Ok)
                                 {
+                                    currStatus.KvCacheResult = decodeResult;
+                                    currStatus.Status = InferenceStatus.Error;
+                                    errors.Add($"Can't infer on conversation: id={currStatus.Id}");
+
                                     AnsiConsole.WriteLine($"Can't Infer: decodeResult={decodeResult}");
                                     break;
                                 }
                             }
 
-                            // Sample from the "guided" conversation. This sampler will internally use the "guidance" conversation
-                            // to steer the conversation. See how this is done in GuidedSampler.ProcessLogits (bottom of this file).
+                            // Sample from the conversation.
                             var currGuidedToken = currGuidedSampler.Sample(executor.Context.NativeHandle, currGuided.Sample(), []);
-                            currGuidedDecoder.Add(currGuidedToken);
+                            currGuidedDecoder.Add(currGuidedToken);     // Note: token is decoded and added to a list of characters.
                             currGuided.Prompt(currGuidedToken);
 
-                            var numTokens = guidedNumTokens[conversationIndex];
-                            guidedNumTokens[conversationIndex] = numTokens + 1;
-                            tokenCount++;
+                            currStatus.NumTokens++;
+                            BatchTokenCount++;
 
-                            // Early exit if we reach the natural end of the guided sentence
+                            // Early exit if we reach the natural end of the response.
                             if (model.Tokens.IsEndOfGeneration(currGuidedToken))
                             {
-                                guidedInProgress.Remove(conversationIndex);
-                                AnsiConsole.WriteLine($"EndOfGeneration Reached: tokenIndex={tokenIndex}, conversationIndex={conversationIndex}: {guidedNumTokens[conversationIndex]} tokens");
+                                currStatus.Status = InferenceStatus.Complete;
+                                AnsiConsole.WriteLine($"EndOfGeneration Reached: tokenIndex={tokenIndex}, conversationIndex={conversationIndex}: {currStatus.NumTokens} tokens");
+                            }
+
+                            if (currStatus.NumTokens >= MAX_CONVERSATION_TOKEN_COUNT)
+                            {
+                                currStatus.Status = InferenceStatus.MaxConversationTokensReached;
+                                AnsiConsole.WriteLine($"MaxConversationTokensReached: tokenIndex={tokenIndex}, conversationIndex={conversationIndex}: {currStatus.NumTokens} tokens");
                             }
                         }
                         catch (Exception e)
                         {
                             AnsiConsole.WriteLine($"EXCEPTION: tokenIndex={tokenIndex}, conversationIndex={conversationIndex}: {e.Message}");
-                            guidedInProgress.Remove(conversationIndex);
+                            mapConversationIdToInferenceData[conversationIndex].Status = InferenceStatus.Error;
                         }
-                    }
-
-                    if (decodeResult != DecodeResult.Ok)
-                    {
-                        break;
+                        finally
+                        {
+                        }
                     }
 
                     // Update progress bar
@@ -148,17 +186,20 @@ public class BatchedExecutorMultiGuidance
            }
         );
 
-        executor.Context.LoadState("SaveState");
-
-        //AnsiConsole.MarkupLine($"[green]Unguided:[/][white]{unguidedDecoder.Read().ReplaceLineEndings(" ")}[/]");
-        for (var conversationIndex = 0; conversationIndex < guidedDecoder.Count; conversationIndex++)
+        AnsiConsole.WriteLine($"TotalBatchTokens: {BatchTokenCount}");
+        foreach (var kvp in mapConversationIdToInferenceData)
         {
-            //AnsiConsole.MarkupLine($"[green]Guided:[/][white]{guidedDecoder.Read().ReplaceLineEndings(" ")}[/]");
-            var currGuidedDecoder = guidedDecoder[conversationIndex];
+            AnsiConsole.WriteLine($"Conversation: {kvp.Key}: {kvp.Value.Status}, {kvp.Value.NumTokens} tokens, {kvp.Value.KvCacheResult}");
+        }
+
+        for (var conversationIndex = 0; conversationIndex < mapConversationIdToInferenceData.Count; conversationIndex++)
+        {
+            var currStatus = mapConversationIdToInferenceData[conversationIndex];
+            var currGuidedDecoder = currStatus.StreamingTokenDecoder; // guidedDecoder[conversationIndex];
             var msg = currGuidedDecoder.Read().ReplaceLineEndings(" ");
-            var numGuidedTokens = guidedNumTokens[conversationIndex];
-            //AnsiConsole.MarkupLine($"[green]Guided: {conversationIndex}: {msg.Length} chars, {numGuidedTokens} tokens; [/][white]{msg}[/]");
-            AnsiConsole.MarkupLine($"[green]Guided: {conversationIndex}: {msg.Length} chars, {numGuidedTokens} tokens[/]");
+            currStatus.Response = msg;
+
+            AnsiConsole.MarkupLine($"[green]Guided: {conversationIndex}: {msg.Length} chars, {currStatus.NumTokens} tokens[/]");
             AnsiConsole.WriteLine($"{msg}");
         }
 
@@ -180,11 +221,15 @@ public class BatchedExecutorMultiGuidance
         AnsiConsole.WriteLine($"Sample Time: {timings.Sampling.TotalMilliseconds}ms");
 
         var totalSeconds = timer.Elapsed.TotalSeconds;
-        var tokensPerSec = tokenCount / totalSeconds;
+        var tokensPerSec = BatchTokenCount / totalSeconds;
 
-        AnsiConsole.MarkupLine($"{tokensPerSec.ToString("N2")} tokens/sec: tokenCount={tokenCount}, elapsed={(timer.Elapsed.TotalSeconds.ToString("N2"))}");
+        AnsiConsole.MarkupLine($"{tokensPerSec.ToString("N2")} tokens/sec: BatchTokenCount={BatchTokenCount}, elapsed={(timer.Elapsed.TotalSeconds.ToString("N2"))}, InferenceDecodeErrorFound={InferenceDecodeErrorFound}, TotalBatchTokensReached={TotalBatchTokensReached}");
+
+        AnsiConsole.WriteLine("DONE.");
+        //executor.Context.LoadState("SaveState");
     }
 
+    #region GuidedSampler
     private class GuidedSampler(Conversation guidance, float weight)
         : BaseSamplingPipeline
     {
@@ -215,7 +260,9 @@ public class BatchedExecutorMultiGuidance
         {
         }
     }
+    #endregion
 
+    #region Test Prompts
     private static readonly string[] questions =
     [
         "What are the main ingredients in a classic Margherita pizza?",
@@ -571,4 +618,5 @@ public class BatchedExecutorMultiGuidance
         "What are some tips for exploring a new city on foot?",
         "How can someone find affordable accommodations while traveling?",
     ];
+    #endregion
 }
