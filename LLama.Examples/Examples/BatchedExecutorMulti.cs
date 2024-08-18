@@ -157,12 +157,14 @@ public class BatchedExecutorMultiGuidance
             var currGuidedDecoder = guidedDecoder[conversationIndex];
             var msg = currGuidedDecoder.Read().ReplaceLineEndings(" ");
             var numGuidedTokens = guidedNumTokens[conversationIndex];
-            AnsiConsole.MarkupLine($"[green]Guided: {conversationIndex}: {msg.Length} chars, {numGuidedTokens} tokens; [/][white]{msg}[/]");
+            //AnsiConsole.MarkupLine($"[green]Guided: {conversationIndex}: {msg.Length} chars, {numGuidedTokens} tokens; [/][white]{msg}[/]");
+            AnsiConsole.MarkupLine($"[green]Guided: {conversationIndex}: {msg.Length} chars, {numGuidedTokens} tokens[/]");
+            AnsiConsole.WriteLine($"{msg}");
         }
 
         var kvNumTokensInCache = executor.Context.NativeHandle.KvCacheCountTokens();
         var kvCacheCellsInUse = executor.Context.NativeHandle.KvCacheCountCells();
-        var kvCachePercentInUse = (float)kvCacheCellsInUse / (float)kvNumTokensInCache;
+        var kvCachePercentInUse = kvNumTokensInCache > 0 ? (float)kvCacheCellsInUse / (float)kvNumTokensInCache : 0.0f;
         AnsiConsole.WriteLine($"kvCache (BEFORE): {kvCachePercentInUse.ToString("N2")}% in use: {kvCacheCellsInUse} / {kvNumTokensInCache}");
         executor.Context.NativeHandle.KvCacheClear();
 
