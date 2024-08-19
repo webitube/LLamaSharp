@@ -1,11 +1,174 @@
+using System.Linq;
+using System.Text.Json;
+using System.Text.Json.Serialization;
+using System.Text.Json.Nodes;
+using LLama.Grammars;
 using LLama.Batched;
 using LLama.Common;
 using LLama.Native;
 using LLama.Sampling;
 using Spectre.Console;
 using System.Diagnostics;
+using DocumentFormat.OpenXml.Spreadsheet;
+using Microsoft.Identity.Client;
+using static Microsoft.KernelMemory.Constants.CustomContext;
 
 namespace LLama.Examples.Examples;
+
+
+public class OutlineTopLevel
+{
+    [JsonPropertyName("topic_sentence")]
+    public string TopicSentence { get; set; } = string.Empty;
+
+    [JsonPropertyName("main_points")]
+    public string[] MainPoints { get; set; } = [];
+
+    public bool HasAllData()
+    {
+        var hasTopicSentence = !string.IsNullOrEmpty(TopicSentence);
+        if (!hasTopicSentence)
+        {
+            return false;
+        }
+        if ((MainPoints == null) || (MainPoints.Length < 3))
+        {
+            return false;
+        }
+        for(var index = 0; index < MainPoints.Length; index++)
+        {
+            if (string.IsNullOrEmpty(MainPoints[index]))
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+}
+
+    public class OutlineMainPoint
+{
+    [JsonPropertyName("main_point_summary")]
+    public string MainPointSummary { get; set; } = string.Empty;
+
+    [JsonPropertyName("supporting_points")]
+    public string[] SupportingPoints { get; set; } = [];
+
+
+    public bool HasAllData()
+    {
+        var hasMainPointSummary = !string.IsNullOrEmpty(MainPointSummary);
+        if (!hasMainPointSummary)
+        {
+            return false;
+        }
+        if ((SupportingPoints == null) || (SupportingPoints.Length < 3))
+        {
+            return false;
+        }
+        for (var index = 0; index < SupportingPoints.Length; index++)
+        {
+            if (string.IsNullOrEmpty(SupportingPoints[index]))
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+}
+
+public class GrammarParser
+{
+    private static GrammarParser instance;
+    public static GrammarParser Instance
+    {
+        get
+        {
+            if (instance == null)
+            {
+                instance = new GrammarParser();
+            }
+            return instance;
+        }
+    }
+
+    private const string GRAMMAR_ROOT_NODE = "root";
+
+    private readonly Dictionary<string, SafeLLamaGrammarHandle> mapTextToGrammarHandle = new();
+
+
+    /// <summary>
+    /// Parse grammar. Json->Json Schema->Json Grammar. Pass the grammar to this function which will generate a list of GrammarRules which 
+    /// can be passed in the chat InferenceParams.
+    /// See also Project Llama.cpp: test-grammar-integration.cpp::build_grammar()
+    /// online tool: https://adrienbrault.github.io/json-schema-to-gbnf/
+    /// llama.cpp: https://github.com/ggerganov/llama.cpp
+    /// </summary>
+    /// <param name="grammarText"></param>
+    /// <returns>clone of the grammar's safe handle</returns>
+    public SafeLLamaGrammarHandle ParseGrammar(string grammarText)
+    {
+        if (mapTextToGrammarHandle.ContainsKey(grammarText))
+        {
+            //Debug.Log($"ParseGrammar(): Found grammar. Returning clone of handle...");
+            return mapTextToGrammarHandle[grammarText].Clone();
+        }
+
+        var parsedGrammar = Grammar.Parse(grammarText, GRAMMAR_ROOT_NODE);
+
+        Debug.Assert(parsedGrammar.Rules.Count > 0, "ParseGrammar(): No Grammar Rules found!");
+
+        // Search for the root rule so that we can .
+        for (var index = 0; index < parsedGrammar.Rules.Count; index++)
+        {
+            if (parsedGrammar.Rules[index].Name.CompareTo(GRAMMAR_ROOT_NODE) == 0)
+            {
+                // Create the handle with an index to the root rule of the grammar.
+                var handle = SafeLLamaGrammarHandle.Create(parsedGrammar.Rules, (ulong)index);
+                mapTextToGrammarHandle[grammarText] = handle;
+                return handle.Clone();
+            }
+        }
+
+        //Debug.LogError($"ParseGrammar(): Grammar doesn't have \"{GRAMMAR_ROOT_NODE}\" node!");
+        return null;
+    }
+
+    public void ReleaseGrammarHandle(SafeLlamaModelHandle handle)
+    {
+        handle.Close();
+    }
+}
+
+public class RandomNumberGenerator
+{
+    private Random _random;
+
+    // Constructor to seed the random number generator
+    public RandomNumberGenerator()
+    {
+        // Get the current time in ticks
+        long ticks = DateTime.Now.Ticks;
+
+        // Compute a hash of the ticks to use as a seed
+        int seed = ticks.GetHashCode();
+
+        // Initialize the Random object with the seed
+        _random = new Random(seed);
+    }
+
+    // Function to generate a random integer within a specified range [min, max)
+    public int RandomRange(int min, int max)
+    {
+        if (min >= max)
+        {
+            throw new ArgumentException("min must be less than max");
+        }
+
+        return _random.Next(min, max);
+    }
+}
+
 
 /// <summary>
 /// This demonstrates using a batch to generate two sequences and then using one
@@ -13,15 +176,39 @@ namespace LLama.Examples.Examples;
 /// </summary>
 public class BatchedExecutorMultiGuidance
 {
-    /// <summary>
-    /// Set how many tokens should be generated
-    /// </summary>
-    private const int TokenCount = 200;
+    //private const int TokenCount = 200;
 
-    private const int MAX_CONVERSATION_TOKEN_COUNT = 200;
-    private const int MAX_BATCH_TOKEN_COUNT = 10000;
+    private const string SYSTEM_PROMPT = "Perform the task to the best of your ability.";
+    private const string INITIAL_PROMPT_FORMAT = "<s>[INST] {0} {1} {2} [/INST] ";
+    private const string FOLLOW_UP_FORMAT = "{0}</s>[INST] {1} [/INST]";
 
-    private const int NUM_BATCHED_CONVERSATIONS = 64;
+    private const string OUTLINE_FORMAT = "**OUTLINE FORMAT**\r\n\r\nUse Roman numerals, capital letters, and Arabic numerals for different levels of information:\r\n\r\nI. Introduction\r\n   A. Background information on the topic\r\n   B. Thesis statement or central argument\r\n   C. Overview of the main points to be discussed\r\n\r\nII. Body Paragraph 1\r\n   A. Topic sentence introducing the main point\r\n   B. Supporting evidence (facts, statistics, examples)\r\n   C. Explanation or analysis of the evidence\r\n   D. Transition to the next point\r\n\r\nIII. Body Paragraph 2\r\n   A. Topic sentence introducing the next main point\r\n   B. Supporting evidence (facts, statistics, examples)\r\n   C. Explanation or analysis of the evidence\r\n   D. Transition to the next point\r\n\r\nIV. Body Paragraph 3 (Optional)\r\n   A. Topic sentence introducing the final main point\r\n   B. Supporting evidence (facts, statistics, examples)\r\n   C. Explanation or analysis of the evidence\r\n   D. Transition to the conclusion\r\n\r\nV. Conclusion\r\n   A. Restatement of the thesis statement\r\n   B. Summary of the main points\r\n   C. Final thoughts or concluding remarks.";
+
+    private const string OUTLINE_TOP_LEVEL_JSON = "{\r\n    \"topic_sentence\": \"Topic Sentence\",\r\n    \"main_points\": [\r\n        \"Main Point 1\",\r\n        \"Main Point 2\",\r\n        \"Main Point 3\"\r\n    ]\r\n}";
+    private const string OUTLINE_TOP_LEVEL_GRAMMAR = "root ::= Outline\r\nOutline ::= \"{\"   ws   \"\\\"topic_sentence\\\":\"   ws   string   \",\"   ws   \"\\\"main_points\\\":\"   ws   stringlist   \"}\"\r\nOutlinelist ::= \"[]\" | \"[\"   ws   Outline   (\",\"   ws   Outline)*   \"]\"\r\nstring ::= \"\\\"\"   ([^\"]*)   \"\\\"\"\r\nboolean ::= \"true\" | \"false\"\r\nws ::= [ \\t\\n]*\r\nnumber ::= [0-9]+   \".\"?   [0-9]*\r\nstringlist ::= \"[\"   ws   \"]\" | \"[\"   ws   string   (\",\"   ws   string)*   ws   \"]\"\r\nnumberlist ::= \"[\"   ws   \"]\" | \"[\"   ws   string   (\",\"   ws   number)*   ws   \"]\"\r\n";
+
+    private const string OUTLINE_MAIN_POINT_JSON = "{\r\n    \"main_point_summary\": \"Main Point Summary\",\r\n    \"supporting_points\": [\r\n        \"Supporting Point 1\",\r\n        \"Supporting Point 2\",\r\n        \"Supporting Point 3\"\r\n    ]\r\n}";
+    private const string OUTLINE_MAIN_POINT_GRAMMAR = "root ::= \"{\" ws01 root-main-point-summary \",\" ws01 root-supporting-points \"}\" ws01\r\nroot-main-point-summary ::= \"\\\"main_point_summary\\\"\" \":\" ws01 string\r\nroot-supporting-points ::= \"\\\"supporting_points\\\"\" \":\" ws01 \"[\" ws01 (root-supporting-points-items (ws01 \",\" ws01 root-supporting-points-items)*)? ws01 \"]\"\r\nroot-supporting-points-items ::= string\r\n\r\n\r\nvalue  ::= (object | array | string | number | boolean | null) ws\r\n\r\nobject ::=\r\n  \"{\" ws (\r\n    string \":\" ws value\r\n    (\",\" ws string \":\" ws value)*\r\n  )? \"}\"\r\n\r\narray  ::=\r\n  \"[\" ws01 (\r\n            value\r\n    (\",\" ws01 value)*\r\n  )? \"]\"\r\n\r\nstring ::=\r\n  \"\\\"\" (string-char)* \"\\\"\"\r\n\r\nstring-char ::= [^\"\\\\] | \"\\\\\" ([\"\\\\/bfnrt] | \"u\" [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F]) # escapes\r\n\r\nnumber ::= integer (\".\" [0-9]+)? ([eE] [-+]? [0-9]+)?\r\ninteger ::= \"-\"? ([0-9] | [1-9] [0-9]*)\r\nboolean ::= \"true\" | \"false\"\r\nnull ::= \"null\"\r\n\r\n# Optional space: by convention, applied in this grammar after literal chars when allowed\r\nws ::= ([ \\t\\n] ws)?\r\nws01 ::= ([ \\t\\n])?";
+
+    private const int MAX_CONVERSATION_TOKEN_COUNT = 30;
+    private const int MAX_BATCH_TOKEN_COUNT = 100; //10000;
+
+    private const int NUM_BATCHED_CONVERSATIONS = 1; //64;
+
+    private const int MAX_NUM_RETRIES = 10;
+
+    private const float DEFAULT_TEMPERATURE = 0.3f;
+
+
+    // Default Inference Parameters
+    public const float DEFAULT_LLM_TEMPERATURE = 0.45f; //0.8f;  // [0..1]
+    public const int DEFAULT_LLM_MAX_TOKENS = -1;       // -1 == no limit
+    public const int DEFAULT_TOP_K = 40;                // Choose from top K tokens
+    public const float DEFAULT_REPEAT_PENALTY = 1.0f;
+    public const float DEFAULT_MIN_P = 0.02f; //0.05f;
+    public const float DEFAULT_TOP_P = 1.0f; //0.95f;
+
+    private static RandomNumberGenerator random = new();
 
     private static bool TotalBatchTokensReached => (BatchTokenCount >= MAX_BATCH_TOKEN_COUNT);
     private static int BatchTokenCount { get; set; }
@@ -30,43 +217,136 @@ public class BatchedExecutorMultiGuidance
     private static DecodeResult InferenceDecodeResult { get; set; } = DEFAULT_INFERENCE_RESULT;
     private static bool InferenceDecodeErrorFound => InferenceDecodeResult != DecodeResult.Ok;
 
+    private static readonly Stopwatch timer = Stopwatch.StartNew();
+    private static DecodeResult decodeResult = DecodeResult.Ok;
+    private static readonly List<string> errors = new();
+    private static readonly Dictionary<int, InferenceResultData> mapConversationIdToInferenceData = new();
+    private static ProgressTask reporter;
+    private static BatchedExecutor executor;
+    private static LLamaWeights model;
+    private static int numIterations = 0;
+
+    private static StatelessExecutor statelessExecutor;
+
+
     public enum InferenceStatus
     {
-        InProgress,
-        Complete,
+        GatherNotes,
+        NotesComplete,
+        WriteOutlineTopLevel,
+        WriteOutlineMainPoint1,
+        WriteOutlineMainPoint2,
+        WriteOutlineMainPoint3,
+        WriteFirstDraft,
+        WriteFinalVersion,
 
         Error,
         MaxConversationTokensReached
     }
 
-    public class InferenceResultData(int id, string userMsg, Conversation conversation, BaseSamplingPipeline samplingPipeline, StreamingTokenDecoder streamingTokenDecoder)
+    public class InferenceResultData(int id, int maxTokens, string userMsg, Conversation conversation, BaseSamplingPipeline samplingPipeline, StreamingTokenDecoder streamingTokenDecoder)
     {
         public int Id { get; set; } = id;
-        public InferenceStatus Status { get; set; } = InferenceStatus.InProgress;
+        public InferenceStatus Status { get; set; } = InferenceStatus.GatherNotes;
         public int NumTokens { get; set; } = 0;
+        public int MaxTokens { get; set; } = maxTokens;
+        public int NumErrors { get; set; } = 0;
+        public int TotalTokens { get; set; } = 0;
         public DecodeResult KvCacheResult { get; set; } = DecodeResult.Ok;
         public string UserMsg { get; set; } = userMsg;
-        public string Response { get; set; } = string.Empty;
+        public List<string> Response { get; set; } = new();
+        public string OutlineResponse { get; set; } = string.Empty;
+        public string FirstDraft { get; set; } = string.Empty;
+        public string EditedResponse { get; set; } = string.Empty;
+        public OutlineTopLevel OutlineTopLevel { get; set; } = new();
+        public Dictionary<int, OutlineMainPoint> OutlineMainPoint { get; set; } = new();
 
         public Conversation Conversation { get; set; } = conversation;
         public BaseSamplingPipeline SamplingPipeline { get; set; } = samplingPipeline;
         public StreamingTokenDecoder StreamingTokenDecoder { get; set; } = streamingTokenDecoder;
+
+        public void DebugWriteOutline()
+        {
+            AnsiConsole.WriteLine($"Q: {UserMsg}\n");
+
+            AnsiConsole.WriteLine($"Topic Sentence: {OutlineTopLevel.TopicSentence}\n");
+
+            AnsiConsole.WriteLine($"I. Main Point 1: {OutlineTopLevel.MainPoints[0]}\n");
+            AnsiConsole.WriteLine($"      Summary: {OutlineMainPoint[0].MainPointSummary}\n");
+            AnsiConsole.WriteLine($"   A. Supporting Point 1.1: {OutlineMainPoint[0].SupportingPoints[0]}");
+            AnsiConsole.WriteLine($"   B. Supporting Point 1.2: {OutlineMainPoint[0].SupportingPoints[1]}");
+            AnsiConsole.WriteLine($"   C. Supporting Point 1.3: {OutlineMainPoint[0].SupportingPoints[2]}\n");
+
+            AnsiConsole.WriteLine($"II. Main Point 2: {OutlineTopLevel.MainPoints[1]}\n");
+            AnsiConsole.WriteLine($"      Summary: {OutlineMainPoint[1].MainPointSummary}\n");
+            AnsiConsole.WriteLine($"   A. Supporting Point 2.1: {OutlineMainPoint[1].SupportingPoints[0]}");
+            AnsiConsole.WriteLine($"   B. Supporting Point 2.2: {OutlineMainPoint[1].SupportingPoints[1]}");
+            AnsiConsole.WriteLine($"   C. Supporting Point 2.3: {OutlineMainPoint[1].SupportingPoints[2]}\n");
+
+            AnsiConsole.WriteLine($"III. Main Point 3: {OutlineTopLevel.MainPoints[2]}\n");
+            AnsiConsole.WriteLine($"      Summary: {OutlineMainPoint[2].MainPointSummary}\n");
+            AnsiConsole.WriteLine($"   A. Supporting Point 3.1: {OutlineMainPoint[2].SupportingPoints[0]}");
+            AnsiConsole.WriteLine($"   B. Supporting Point 3.2: {OutlineMainPoint[2].SupportingPoints[1]}");
+            AnsiConsole.WriteLine($"   C. Supporting Point 3.3: {OutlineMainPoint[2].SupportingPoints[2]}\n");
+        }
     }
 
     public static async Task Run()
     {
+        await Init();
+
+        // Run inference loop
+        numIterations++;
+        await AnsiConsole
+           .Progress()
+           .StartAsync(async progress =>
+            {
+                reporter = progress.AddTask($"Running Inference {numIterations}", maxValue: MAX_CONVERSATION_TOKEN_COUNT);
+
+                await RunBatchedInference();
+           }
+        );
+
+        ReportResults();
+
+        while (await Continue())
+        {
+            // Run inference loop
+            numIterations++;
+            await AnsiConsole
+               .Progress()
+               .StartAsync(async progress =>
+               {
+                   reporter = progress.AddTask($"Running Inference {numIterations}", maxValue: MAX_CONVERSATION_TOKEN_COUNT);
+
+                   await RunBatchedInference();
+               }
+            );
+
+            ReportResults();
+        }
+        AnsiConsole.WriteLine("DONE.");
+    }
+
+    private static async Task Init()
+    {
+        AnsiConsole.WriteLine("BEGIN...");
+
         // Load model weights
         var parameters = new ModelParams(UserSettings.GetModelPath());
+        parameters.GpuLayerCount = 35;
         //parameters.GpuLayerCount = 8;
         //parameters.NoKqvOffload = true;
-        using var model = await LLamaWeights.LoadFromFileAsync(parameters);
+        model = await LLamaWeights.LoadFromFileAsync(parameters);
+
+        statelessExecutor = new StatelessExecutor(model, parameters);
 
         //var positivePrompt = AnsiConsole.Ask("Positive Prompt (or ENTER for default):", "My favourite colour is").Trim();
         //var negativePrompt = AnsiConsole.Ask("Negative Prompt (or ENTER for default):", "I hate the colour red. My favourite colour is").Trim();
-        var weight = AnsiConsole.Ask("Guidance Weight (or ENTER for default):", 2.0f);
+        //var weight = AnsiConsole.Ask("Guidance Weight (or ENTER for default):", 2.0f);
 
         // Create an executor that can evaluate a batch of conversations together
-        using var executor = new BatchedExecutor(model, parameters);
+        executor = new BatchedExecutor(model, parameters);
 
         executor.Context.SaveState("SaveState");
 
@@ -82,110 +362,265 @@ public class BatchedExecutorMultiGuidance
         //var guidedNumTokens = new List<int>();
 
         //var activeConversations = new Queue<InferenceResultData>();
-        var mapConversationIdToInferenceData = new Dictionary<int, InferenceResultData>();
+        mapConversationIdToInferenceData.Clear();
+
+        // Init Random number generator
+        new Random(questions.Length - 1);
 
         for (var index = 0; index < NUM_BATCHED_CONVERSATIONS; index++)
         {
-            var promptIndex = index % questions.Length;
+            //var promptIndex = index % questions.Length;
+            var promptIndex = random.RandomRange(0, questions.Length - 1);
             var currPrompt = questions[promptIndex];
 
             var currGuided = executor.Create();
             currGuided.Prompt(executor.Context.Tokenize(currPrompt));
 
-            var samplingPipeline = new DefaultSamplingPipeline();
+            var samplingPipeline = new DefaultSamplingPipeline()
+            {
+                Temperature = DEFAULT_TEMPERATURE,
+                PenalizeNewline = false,
+                RepeatPenalty = DEFAULT_REPEAT_PENALTY,
+                MinP = DEFAULT_MIN_P,
+                TopP = DEFAULT_TOP_P,
+                TopK = DEFAULT_TOP_K
+            };
             var streamingTokenDecoder = new StreamingTokenDecoder(executor.Context);
 
             // Initialize the conversations that are active and the number of tokens they've received.
-            mapConversationIdToInferenceData.Add(index, new(index, currPrompt, currGuided, samplingPipeline, streamingTokenDecoder));
+            mapConversationIdToInferenceData.Add(index, new(index, MAX_CONVERSATION_TOKEN_COUNT, currPrompt, currGuided, samplingPipeline, streamingTokenDecoder));
         }
 
         BatchTokenCount = 0; // guided and unguided.
-        var timer = Stopwatch.StartNew();
-        var decodeResult = DecodeResult.Ok;
-        var errors = new List<string>();
+        timer.Restart();
+        decodeResult = DecodeResult.Ok;
+        errors.Clear();
+    }
 
-        // Run inference loop
-        await AnsiConsole
-           .Progress()
-           .StartAsync(async progress =>
+    private static async Task<bool>Continue()
+    {
+        AnsiConsole.WriteLine("CONTINUE...");
+
+        BatchTokenCount = 0;
+        InferenceDecodeResult = DecodeResult.Ok;
+
+        executor.Context.NativeHandle.KvCacheClear();
+        var result = await executor.Infer();
+        var numInProgress = 0;
+        foreach (var kvp in mapConversationIdToInferenceData)
+        {
+            var currStatus = kvp.Value;
+            if (currStatus.Status == InferenceStatus.WriteFinalVersion)
             {
-                var reporter = progress.AddTask("Running Inference", maxValue: TokenCount);
-                for (var tokenIndex = 0; (tokenIndex < TokenCount) && !TotalBatchTokensReached && (errors.Count == 0); tokenIndex++)
+                continue;
+            }
+            if (currStatus.Status == InferenceStatus.NotesComplete)
+            {
+                await RewriteResponse(currStatus);
+                continue;
+            }
+            if (currStatus.Status == InferenceStatus.Error)
+            {
+                currStatus.NumErrors++;
+                if (currStatus.NumErrors < 3)
                 {
-                    for(var conversationIndex =  0; (conversationIndex < NUM_BATCHED_CONVERSATIONS) && !InferenceDecodeErrorFound && !TotalBatchTokensReached; conversationIndex++)
-                    {
-                        try
-                        {
-                            var currStatus = mapConversationIdToInferenceData[conversationIndex];
-                            if (currStatus.Status != InferenceStatus.InProgress)
-                            {
-                                continue;
-                            }
-
-                            var currGuided = currStatus.Conversation;
-                            var currGuidedSampler = currStatus.SamplingPipeline as DefaultSamplingPipeline;
-                            var currGuidedDecoder = currStatus.StreamingTokenDecoder;
-
-                            if ((currGuided == null) || (currGuidedSampler == null) || (currGuidedDecoder == null))
-                            {
-                                errors.Add($"currGuided={currGuided}, currGuidedSampler={currGuidedSampler}, currGuidedDecoder={currGuidedDecoder}");
-                                break;
-                            }
-
-                            // Try to infer on the current conversation. If an error occurs (likely NoKvSlot), set the current
-                            // conversations error status and code and abort.
-                            if (currGuided.RequiresInference)
-                            {
-                                decodeResult = await executor.Infer();
-                                if (decodeResult != DecodeResult.Ok)
-                                {
-                                    currStatus.KvCacheResult = decodeResult;
-                                    currStatus.Status = InferenceStatus.Error;
-                                    errors.Add($"Can't infer on conversation: id={currStatus.Id}");
-
-                                    AnsiConsole.WriteLine($"Can't Infer: decodeResult={decodeResult}");
-                                    break;
-                                }
-                            }
-
-                            // Sample from the conversation.
-                            var currGuidedToken = currGuidedSampler.Sample(executor.Context.NativeHandle, currGuided.Sample(), []);
-                            currGuidedDecoder.Add(currGuidedToken);     // Note: token is decoded and added to a list of characters.
-                            currGuided.Prompt(currGuidedToken);
-
-                            currStatus.NumTokens++;
-                            BatchTokenCount++;
-
-                            // Early exit if we reach the natural end of the response.
-                            if (model.Tokens.IsEndOfGeneration(currGuidedToken))
-                            {
-                                currStatus.Status = InferenceStatus.Complete;
-                                AnsiConsole.WriteLine($"EndOfGeneration Reached: tokenIndex={tokenIndex}, conversationIndex={conversationIndex}: {currStatus.NumTokens} tokens");
-                            }
-
-                            if (currStatus.NumTokens >= MAX_CONVERSATION_TOKEN_COUNT)
-                            {
-                                currStatus.Status = InferenceStatus.MaxConversationTokensReached;
-                                AnsiConsole.WriteLine($"MaxConversationTokensReached: tokenIndex={tokenIndex}, conversationIndex={conversationIndex}: {currStatus.NumTokens} tokens");
-                            }
-                        }
-                        catch (Exception e)
-                        {
-                            AnsiConsole.WriteLine($"EXCEPTION: tokenIndex={tokenIndex}, conversationIndex={conversationIndex}: {e.Message}");
-                            mapConversationIdToInferenceData[conversationIndex].Status = InferenceStatus.Error;
-                        }
-                        finally
-                        {
-                        }
-                    }
-
-                    // Update progress bar
-                    reporter.Increment(1.0);
+                    currStatus.Status = InferenceStatus.GatherNotes;
                 }
-                timer.Stop();
-           }
-        );
+            }
+            if (currStatus.Status == InferenceStatus.Error)
+            {
+                await RewriteResponse(currStatus);
+                continue;
+            }
+            currStatus.TotalTokens += currStatus.NumTokens;
+            if (currStatus.TotalTokens >= MAX_CONVERSATION_TOKEN_COUNT * 10)
+            {
+                currStatus.Status = InferenceStatus.MaxConversationTokensReached;
+                await RewriteResponse(currStatus);
+                continue;
+            }
 
+            var currConversation = currStatus.Conversation;
+
+            var concatenatedResponse = string.Concat(currStatus.Response);
+            var prompt = $"<s>[INST] {SYSTEM_PROMPT} Carefully read the following Question and Answer. In your response, write what comes next.\nQuestion: \"{currStatus.UserMsg}\"\nAnswer: \"{concatenatedResponse}\" </s>";
+            currStatus.Conversation.Prompt(executor.Context.Tokenize(prompt));
+
+            currStatus.Status = InferenceStatus.GatherNotes;
+            currStatus.NumTokens = 0;
+            numInProgress++;
+        }
+
+        AnsiConsole.WriteLine($"Continue: numInProgress={numInProgress}");
+        return (numInProgress > 0);
+    }
+
+    private static async Task RewriteResponse(InferenceResultData currStatus)
+    {
+        var concatenatedResponse = string.Concat(currStatus.Response);
+        bool hasTopLevel = await WriteOutlineTopLevel(currStatus, concatenatedResponse);
+        bool hasMainPoint1 = await WriteOutlineMainPoint(currStatus, concatenatedResponse, 0);
+        bool hasMainPoint2 = await WriteOutlineMainPoint(currStatus, concatenatedResponse, 1);
+        bool hasMainPoint3 = await WriteOutlineMainPoint(currStatus, concatenatedResponse, 2);
+
+        if (hasTopLevel && hasMainPoint1 && hasMainPoint2 && hasMainPoint3)
+        {
+            currStatus.DebugWriteOutline();
+        }
+
+        //// Rewrite response using a stateless executor and put the result in currStatus.EditedResponse.
+        ////var prompt = $"{SYSTEM_PROMPT} Rewrite the following paragraph and fix its grammar and prose so that it reads better. Write at a college-graduate level.\n*** Paragraph ***:{concatenatedResponse}";
+        //var prompt = $"{SYSTEM_PROMPT}\n\n**CONTEXT**\n{concatenatedResponse}\n\n**USER**\n{currStatus.UserMsg}. Carefully and closely read the information provided in **CONTEXT* to write your response. Write at a college-graduate level.\n\n**ASSISTANT**\n";
+        //var response = await statelessExecutor.InferAsync(prompt, statelessInferenceParams).ToListAsync();
+        //currStatus.EditedResponse = string.Concat(response);
+        //currStatus.Status = InferenceStatus.WriteFinalVersion;
+    }
+
+
+
+    private static async Task<bool> WriteOutlineTopLevel(InferenceResultData currStatus, string concatenatedResponse)
+    {
+        var prompt = $"{SYSTEM_PROMPT} Write your reponse using the following **JSON Format**\n{OUTLINE_TOP_LEVEL_JSON}\n\n**CONTEXT**\n{concatenatedResponse}\n\n**USER**\n{currStatus.UserMsg}. Carefully and closely read the information provided in **CONTEXT** and enumerate 3 MAIN POINTS. Then, Write a TOPIC SENTENCE by summarizing the 3 MAIN POINTS.\n\n**ASSISTANT**\n";
+
+        var statelessInferenceParams = GetStatelessInferenceParams(OUTLINE_TOP_LEVEL_GRAMMAR);
+
+        var numRetries = 0;
+        var hasAllData = false;
+        while ((numRetries < MAX_NUM_RETRIES) && !hasAllData)
+        {
+            AnsiConsole.WriteLine($"WriteOutlineTopLevel():  Try {numRetries + 1} of {MAX_NUM_RETRIES}");
+            var response = await statelessExecutor.InferAsync(prompt, statelessInferenceParams).ToListAsync();
+            currStatus.OutlineResponse = string.Concat(response);
+
+            try
+            {
+                var outlineTopLevel = JsonSerializer.Deserialize<OutlineTopLevel>(currStatus.OutlineResponse);
+                if ((outlineTopLevel != null) && (hasAllData = outlineTopLevel.HasAllData()))
+                {
+                    currStatus.OutlineTopLevel = outlineTopLevel;
+                }
+            }
+            catch (Exception e)
+            {
+                AnsiConsole.WriteException(e);
+            }
+
+            if (!hasAllData)
+            {
+                statelessInferenceParams = GetStatelessInferenceParams(OUTLINE_TOP_LEVEL_GRAMMAR, 0.8f);
+                numRetries++;
+            }
+        }
+
+        currStatus.Status = InferenceStatus.WriteOutlineTopLevel;
+
+        AnsiConsole.WriteLine($"-->WriteOutlineTopLevel():  {(hasAllData ? "SUCCESS" : "FAILURE")}");
+        return hasAllData;
+    }
+
+    private static InferenceParams GetStatelessInferenceParams(string grammar, float temperatureOverride = DEFAULT_TEMPERATURE)
+    {
+        var handle = GrammarParser.Instance.ParseGrammar(grammar);
+        var statelessInferenceParams = new InferenceParams()
+        {
+            SamplingPipeline = new DefaultSamplingPipeline
+            {
+                Temperature = DEFAULT_TEMPERATURE,
+                TopK = DEFAULT_TOP_K,
+                TopP = DEFAULT_TOP_P,
+                MinP = DEFAULT_MIN_P,
+                RepeatPenalty = DEFAULT_REPEAT_PENALTY,
+                PenalizeNewline = false,
+                Grammar = handle
+            },
+
+            AntiPrompts = new List<string> { "Question:", "#", "Question: ", ".\n" },
+            MaxTokens = 300
+        };
+        return statelessInferenceParams;
+    }
+
+    private static async Task<bool> WriteOutlineMainPoint(InferenceResultData currStatus, string concatenatedResponse, int mainPointIndex)
+    {
+        var prompt = $"{SYSTEM_PROMPT} Write your reponse using the following **JSON Format**\n{OUTLINE_MAIN_POINT_JSON}\n\n**CONTEXT**\n{concatenatedResponse}\n\n**MAIN POINT**\n{currStatus.OutlineTopLevel.MainPoints[mainPointIndex]}\n\n**USER**\nCarefully and closely read **CONTEXT** and **MAIN POINT** and Write 3 Supporting Points for it. Then, write a **MAIN POINT SUMMARY**.\n\n**ASSISTANT**\n";
+
+        var statelessInferenceParams = GetStatelessInferenceParams(OUTLINE_MAIN_POINT_GRAMMAR);
+
+        var numRetries = 0;
+        var hasAllData = false;
+        while ((numRetries < MAX_NUM_RETRIES) && !hasAllData)
+        {
+            AnsiConsole.WriteLine($"WriteOutlineMainPoint():  MainPoint {mainPointIndex + 1}:  Try {numRetries + 1} of {MAX_NUM_RETRIES}");
+            var response = await statelessExecutor.InferAsync(prompt, statelessInferenceParams).ToListAsync();
+            currStatus.OutlineResponse = string.Concat(response);
+
+            try
+            {
+                var outlineMainPoint = JsonSerializer.Deserialize<OutlineMainPoint>(currStatus.OutlineResponse);
+                if ((outlineMainPoint != null) && (hasAllData = outlineMainPoint.HasAllData()))
+                {
+                    currStatus.OutlineMainPoint.Add(mainPointIndex, outlineMainPoint);
+                }
+            }
+            catch (Exception e)
+            {
+                AnsiConsole.WriteException(e);
+            }
+
+            if (!hasAllData)
+            {
+                statelessInferenceParams = GetStatelessInferenceParams(OUTLINE_MAIN_POINT_GRAMMAR, 0.8f);
+                numRetries++;
+            }
+        }
+
+        switch (mainPointIndex)
+        {
+            case 0:
+                currStatus.Status = InferenceStatus.WriteOutlineMainPoint1;
+                break;
+            case 1:
+                currStatus.Status = InferenceStatus.WriteOutlineMainPoint2;
+                break;
+            case 2:
+                currStatus.Status = InferenceStatus.WriteOutlineMainPoint3;
+                break;
+            default:
+                AnsiConsole.WriteLine($"mainPointIndex out of rangle: {mainPointIndex}");
+                break;
+        }
+        AnsiConsole.WriteLine($"-->WriteOutlineMainPoint():  MainPoint {mainPointIndex + 1}:  {(hasAllData ? "SUCCESS" : "FAILURE")}");
+        return hasAllData;
+    }
+
+    private static async Task WriteFirstDraft(InferenceResultData currStatus, string concatenatedResponse, string outline)
+    {
+        //var handle = GrammarParser.Instance.ParseGrammar(OUTLINE_GRAMMAR);
+        var statelessInferenceParams = new InferenceParams()
+        {
+            SamplingPipeline = new DefaultSamplingPipeline
+            {
+                Temperature = DEFAULT_TEMPERATURE,
+                TopK = DEFAULT_TOP_K,
+                TopP = DEFAULT_TOP_P,
+                MinP = DEFAULT_MIN_P,
+                RepeatPenalty = DEFAULT_REPEAT_PENALTY,
+                //Grammar = handle
+            },
+
+            AntiPrompts = new List<string> { "Question:", "#", "Question: ", ".\n" },
+            MaxTokens = 300
+        };
+
+        var prompt = $"{SYSTEM_PROMPT}\n\n**OUTLINE**\n{outline}\n\n**USER**\n{currStatus.UserMsg}. Carefully and closely read the **OUTLINE**. Write the paragraph for the first topic. Write at the college-graduate level.\n\n**ASSISTANT**\n";
+        var response = await statelessExecutor.InferAsync(prompt, statelessInferenceParams).ToListAsync();
+        currStatus.FirstDraft = string.Concat(response);
+        currStatus.Status = InferenceStatus.WriteFirstDraft;
+    }
+
+
+    private static void ReportResults()
+    {
         AnsiConsole.WriteLine($"TotalBatchTokens: {BatchTokenCount}");
         foreach (var kvp in mapConversationIdToInferenceData)
         {
@@ -197,7 +632,26 @@ public class BatchedExecutorMultiGuidance
             var currStatus = mapConversationIdToInferenceData[conversationIndex];
             var currGuidedDecoder = currStatus.StreamingTokenDecoder; // guidedDecoder[conversationIndex];
             var msg = currGuidedDecoder.Read().ReplaceLineEndings(" ");
-            currStatus.Response = msg;
+
+            // Clip the last word.
+            if (!string.IsNullOrEmpty(msg) && !msg.EndsWith(' '))
+            {
+                var lastSpaceIndex = msg.LastIndexOf(" ");
+                msg = msg.Substring(0, lastSpaceIndex);
+            }
+            var lines = msg.Split("\n").ToList();
+            for(var index = 0; index < lines.Count; index++)
+            {
+                lines[index] = lines[index].Trim();
+            }
+            if (currStatus.Response.Count == 0)
+            {
+                currStatus.Response.AddRange(lines);
+            }
+            else
+            {
+                currStatus.Response.InsertRange(currStatus.Response.Count, lines);
+            }
 
             AnsiConsole.MarkupLine($"[green]Guided: {conversationIndex}: {msg.Length} chars, {currStatus.NumTokens} tokens[/]");
             AnsiConsole.WriteLine($"{msg}");
@@ -207,7 +661,9 @@ public class BatchedExecutorMultiGuidance
         var kvCacheCellsInUse = executor.Context.NativeHandle.KvCacheCountCells();
         var kvCachePercentInUse = kvNumTokensInCache > 0 ? (float)kvCacheCellsInUse / (float)kvNumTokensInCache : 0.0f;
         AnsiConsole.WriteLine($"kvCache (BEFORE): {kvCachePercentInUse.ToString("N2")}% in use: {kvCacheCellsInUse} / {kvNumTokensInCache}");
-        executor.Context.NativeHandle.KvCacheClear();
+        //executor.Context.NativeHandle.KvCacheClear();
+        executor.Context.NativeHandle.KvCacheDefrag();
+        executor.Context.NativeHandle.KvCacheUpdate();
 
         kvCacheCellsInUse = executor.Context.NativeHandle.KvCacheCountCells();
         kvCachePercentInUse = kvNumTokensInCache > 0 ? (float)kvCacheCellsInUse / (float)kvNumTokensInCache : 0.0f;
@@ -225,8 +681,85 @@ public class BatchedExecutorMultiGuidance
 
         AnsiConsole.MarkupLine($"{tokensPerSec.ToString("N2")} tokens/sec: BatchTokenCount={BatchTokenCount}, elapsed={(timer.Elapsed.TotalSeconds.ToString("N2"))}, InferenceDecodeErrorFound={InferenceDecodeErrorFound}, TotalBatchTokensReached={TotalBatchTokensReached}");
 
-        AnsiConsole.WriteLine("DONE.");
+        AnsiConsole.WriteLine("ReportResults(): END.");
         //executor.Context.LoadState("SaveState");
+    }
+
+    private static async Task RunBatchedInference()
+    {
+        for (var tokenIndex = 0; (tokenIndex < MAX_CONVERSATION_TOKEN_COUNT) && !TotalBatchTokensReached && (errors.Count == 0); tokenIndex++)
+        {
+            for (var conversationIndex = 0; (conversationIndex < NUM_BATCHED_CONVERSATIONS) && !InferenceDecodeErrorFound && !TotalBatchTokensReached; conversationIndex++)
+            {
+                try
+                {
+                    var currStatus = mapConversationIdToInferenceData[conversationIndex];
+                    if (currStatus.Status != InferenceStatus.GatherNotes)
+                    {
+                        continue;
+                    }
+
+                    var currGuided = currStatus.Conversation;
+                    var currGuidedSampler = currStatus.SamplingPipeline as DefaultSamplingPipeline;
+                    var currGuidedDecoder = currStatus.StreamingTokenDecoder;
+
+                    if ((currGuided == null) || (currGuidedSampler == null) || (currGuidedDecoder == null))
+                    {
+                        errors.Add($"currGuided={currGuided}, currGuidedSampler={currGuidedSampler}, currGuidedDecoder={currGuidedDecoder}");
+                        break;
+                    }
+
+                    // Try to infer on the current conversation. If an error occurs (likely NoKvSlot), set the current
+                    // conversations error status and code and abort.
+                    if (currGuided.RequiresInference)
+                    {
+                        decodeResult = await executor.Infer();
+                        if (decodeResult != DecodeResult.Ok)
+                        {
+                            currStatus.KvCacheResult = decodeResult;
+                            currStatus.Status = InferenceStatus.Error;
+                            errors.Add($"Can't infer on conversation: id={currStatus.Id}");
+
+                            AnsiConsole.WriteLine($"Can't Infer: decodeResult={decodeResult}");
+                            break;
+                        }
+                    }
+
+                    // Sample from the conversation.
+                    var currGuidedToken = currGuidedSampler.Sample(executor.Context.NativeHandle, currGuided.Sample(), []);
+                    currGuidedDecoder.Add(currGuidedToken);     // Note: token is decoded and added to a list of characters.
+                    currGuided.Prompt(currGuidedToken);
+
+                    currStatus.NumTokens++;
+                    BatchTokenCount++;
+
+                    // Early exit if we reach the natural end of the response.
+                    if (model.Tokens.IsEndOfGeneration(currGuidedToken))
+                    {
+                        currStatus.Status = InferenceStatus.NotesComplete;
+                        AnsiConsole.WriteLine($"EndOfGeneration Reached: tokenIndex={tokenIndex}, conversationIndex={conversationIndex}: {currStatus.NumTokens} tokens");
+                    }
+
+                    if (currStatus.NumTokens >= MAX_CONVERSATION_TOKEN_COUNT)
+                    {
+                        currStatus.Status = InferenceStatus.MaxConversationTokensReached;
+                        AnsiConsole.WriteLine($"MaxConversationTokensReached: tokenIndex={tokenIndex}, conversationIndex={conversationIndex}: {currStatus.NumTokens} tokens");
+                    }
+                }
+                catch (Exception e)
+                {
+                    AnsiConsole.WriteLine($"EXCEPTION: tokenIndex={tokenIndex}, conversationIndex={conversationIndex}: {e.Message}");
+                    mapConversationIdToInferenceData[conversationIndex].Status = InferenceStatus.Error;
+                }
+                finally
+                {
+                }
+            }
+
+            // Update progress bar
+            reporter.Increment(1.0);
+        }
+        timer.Stop();
     }
 
     #region GuidedSampler
