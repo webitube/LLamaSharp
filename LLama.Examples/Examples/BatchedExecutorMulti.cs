@@ -92,7 +92,7 @@ public class GrammarParser
         }
     }
 
-    private const string GRAMMAR_ROOT_NODE = "root";
+    public const string GRAMMAR_ROOT_NODE = "root";     // NEW: DEBUG
 
     private readonly Dictionary<string, SafeLLamaGrammarHandle> mapTextToGrammarHandle = new();
 
@@ -190,7 +190,7 @@ public class BatchedExecutorMultiGuidance
     private const string OUTLINE_MAIN_POINT_JSON = "{\r\n    \"main_point_summary\": \"Main Point Summary\",\r\n    \"supporting_points\": [\r\n        \"Supporting Point 1\",\r\n        \"Supporting Point 2\",\r\n        \"Supporting Point 3\"\r\n    ]\r\n}";
     private const string OUTLINE_MAIN_POINT_GRAMMAR = "root ::= \"{\" ws01 root-main-point-summary \",\" ws01 root-supporting-points \"}\" ws01\r\nroot-main-point-summary ::= \"\\\"main_point_summary\\\"\" \":\" ws01 string\r\nroot-supporting-points ::= \"\\\"supporting_points\\\"\" \":\" ws01 \"[\" ws01 (root-supporting-points-items (ws01 \",\" ws01 root-supporting-points-items)*)? ws01 \"]\"\r\nroot-supporting-points-items ::= string\r\n\r\n\r\nvalue  ::= (object | array | string | number | boolean | null) ws\r\n\r\nobject ::=\r\n  \"{\" ws (\r\n    string \":\" ws value\r\n    (\",\" ws string \":\" ws value)*\r\n  )? \"}\"\r\n\r\narray  ::=\r\n  \"[\" ws01 (\r\n            value\r\n    (\",\" ws01 value)*\r\n  )? \"]\"\r\n\r\nstring ::=\r\n  \"\\\"\" (string-char)* \"\\\"\"\r\n\r\nstring-char ::= [^\"\\\\] | \"\\\\\" ([\"\\\\/bfnrt] | \"u\" [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F]) # escapes\r\n\r\nnumber ::= integer (\".\" [0-9]+)? ([eE] [-+]? [0-9]+)?\r\ninteger ::= \"-\"? ([0-9] | [1-9] [0-9]*)\r\nboolean ::= \"true\" | \"false\"\r\nnull ::= \"null\"\r\n\r\n# Optional space: by convention, applied in this grammar after literal chars when allowed\r\nws ::= ([ \\t\\n] ws)?\r\nws01 ::= ([ \\t\\n])?";
 
-    private const int MAX_CONVERSATION_TOKEN_COUNT = 30;
+    private const int MAX_CONVERSATION_TOKEN_COUNT = 300;            // NEW: DEBUG
     private const int MAX_BATCH_TOKEN_COUNT = 100; //10000;
 
     private const int NUM_BATCHED_CONVERSATIONS = 1; //64;
@@ -260,6 +260,8 @@ public class BatchedExecutorMultiGuidance
         public string EditedResponse { get; set; } = string.Empty;
         public OutlineTopLevel OutlineTopLevel { get; set; } = new();
         public Dictionary<int, OutlineMainPoint> OutlineMainPoint { get; set; } = new();
+
+        //public FixedSizeQueue<LLamaToken> LastTokens = null; // = new((int)Context.ContextSize);             // NEW: DEBUG
 
         public Conversation Conversation { get; set; } = conversation;
         public BaseSamplingPipeline SamplingPipeline { get; set; } = samplingPipeline;
@@ -337,13 +339,13 @@ public class BatchedExecutorMultiGuidance
         parameters.GpuLayerCount = 35;
         //parameters.GpuLayerCount = 8;
         //parameters.NoKqvOffload = true;
-        model = await LLamaWeights.LoadFromFileAsync(parameters);
+        model ??= await LLamaWeights.LoadFromFileAsync(parameters);          // NEW: DEBUG
 
         statelessExecutor = new StatelessExecutor(model, parameters);
 
         //var positivePrompt = AnsiConsole.Ask("Positive Prompt (or ENTER for default):", "My favourite colour is").Trim();
         //var negativePrompt = AnsiConsole.Ask("Negative Prompt (or ENTER for default):", "I hate the colour red. My favourite colour is").Trim();
-        //var weight = AnsiConsole.Ask("Guidance Weight (or ENTER for default):", 2.0f);
+        var weight = AnsiConsole.Ask("Guidance Weight (or ENTER for default):", 2.0f);
 
         // Create an executor that can evaluate a batch of conversations together
         executor = new BatchedExecutor(model, parameters);
@@ -373,22 +375,53 @@ public class BatchedExecutorMultiGuidance
             var promptIndex = random.RandomRange(0, questions.Length - 1);
             var currPrompt = questions[promptIndex];
 
-            var currGuided = executor.Create();
-            currGuided.Prompt(executor.Context.Tokenize(currPrompt));
+            // NEW: DEBUG
+            // BEGIN NEW ////////////////////////////
+            var exampleJson = "**JSON FORMAT**\n{\"answer\":\"answer text\"}";
+            currPrompt = $"What is the capital of California? Reply using JSON.\n{exampleJson}";
 
-            var samplingPipeline = new DefaultSamplingPipeline()
+            // Keep track of the last N tokens emitted
+            //var repeatLastTokensCount = model.ContextSize;
+            //var repeat_last_n = repeatLastTokensCount; // Math.Max(0, inferenceParams.RepeatLastTokensCount < 0 ? _weights.ContextSize : inferenceParams.RepeatLastTokensCount);
+            //var lastTokens = new FixedSizeQueue<LLamaToken>(repeat_last_n);
+            //for (var i = 0; i < repeat_last_n; i++)
+            //{
+            //    lastTokens.Enqueue(0);
+            //}
+            // END NEW ////////////////////////////
+
+
+            var currGuided = executor.Create();
+
+            // NEW: DEBUG
+            // BEGIN NEW ////////////////////////////
+            var tokens = executor.Context.Tokenize(currPrompt);
+            //for(var i = 0; i < tokens.Length; i++)
+            //{
+            //    lastTokens.Enqueue(tokens[i]);
+            //}
+
+            currGuided.Prompt(tokens);
+
+            var handle = GrammarParser.Instance.ParseGrammar("root ::= \"{\" ws01 root-answer \"}\" ws01\r\nroot-answer ::= \"\\\"answer\\\"\" \":\" ws01 string\r\n\r\n\r\nvalue  ::= (object | array | string | number | boolean | null) ws\r\n\r\nobject ::=\r\n  \"{\" ws (\r\n    string \":\" ws value\r\n    (\",\" ws string \":\" ws value)*\r\n  )? \"}\"\r\n\r\narray  ::=\r\n  \"[\" ws01 (\r\n            value\r\n    (\",\" ws01 value)*\r\n  )? \"]\"\r\n\r\nstring ::=\r\n  \"\\\"\" (string-char)* \"\\\"\"\r\n\r\nstring-char ::= [^\"\\\\] | \"\\\\\" ([\"\\\\/bfnrt] | \"u\" [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F]) # escapes\r\n\r\nnumber ::= integer (\".\" [0-9]+)? ([eE] [-+]? [0-9]+)?\r\ninteger ::= \"-\"? ([0-9] | [1-9] [0-9]*)\r\nboolean ::= \"true\" | \"false\"\r\nnull ::= \"null\"\r\n\r\n# Optional space: by convention, applied in this grammar after literal chars when allowed\r\nws ::= ([ \\t\\n] ws)?\r\nws01 ::= ([ \\t\\n])?");
+            var samplingPipeline = new DefaultSamplingPipeline() //new GuidedSampler(currGuided, weight)  //DefaultSamplingPipeline()  //BatchedGrammarSamplerPipeline()    //DefaultSamplingPipeline()
+            // END NEW ////////////////////////////
             {
-                Temperature = DEFAULT_TEMPERATURE,
-                PenalizeNewline = false,
-                RepeatPenalty = DEFAULT_REPEAT_PENALTY,
-                MinP = DEFAULT_MIN_P,
-                TopP = DEFAULT_TOP_P,
-                TopK = DEFAULT_TOP_K
+                //Temperature = DEFAULT_TEMPERATURE,
+                //PenalizeNewline = false,
+                //RepeatPenalty = DEFAULT_REPEAT_PENALTY,
+                //MinP = DEFAULT_MIN_P,
+                //TopP = DEFAULT_TOP_P,
+                //TopK = DEFAULT_TOP_K,                           // NEW: DEBUG
+                Grammar = handle            // update Grammar   // NEW: DEBUG
             };
             var streamingTokenDecoder = new StreamingTokenDecoder(executor.Context);
 
             // Initialize the conversations that are active and the number of tokens they've received.
-            mapConversationIdToInferenceData.Add(index, new(index, MAX_CONVERSATION_TOKEN_COUNT, currPrompt, currGuided, samplingPipeline, streamingTokenDecoder));
+            var currStatus = new InferenceResultData(index, MAX_CONVERSATION_TOKEN_COUNT, currPrompt, currGuided, samplingPipeline, streamingTokenDecoder);     // NEW: DEBUG
+            //currStatus.LastTokens = lastTokens;                                                                                                                 // NEW: DEBUG
+                                                                                                                                                                // NEW: DEBUG
+            mapConversationIdToInferenceData.Add(index, currStatus);                                                                                            // NEW: DEBUG
         }
 
         BatchTokenCount = 0; // guided and unguided.
@@ -445,6 +478,9 @@ public class BatchedExecutorMultiGuidance
             var concatenatedResponse = string.Concat(currStatus.Response);
             var prompt = $"<s>[INST] {SYSTEM_PROMPT} Carefully read the following Question and Answer. In your response, write what comes next.\nQuestion: \"{currStatus.UserMsg}\"\nAnswer: \"{concatenatedResponse}\" </s>";
             currStatus.Conversation.Prompt(executor.Context.Tokenize(prompt));
+
+            // --> NEW: Reset the decoder before we do a "continue"...          // NEW: DEBUG
+            currStatus.StreamingTokenDecoder.Reset();                           // NEW: DEBUG
 
             currStatus.Status = InferenceStatus.GatherNotes;
             currStatus.NumTokens = 0;
@@ -531,7 +567,7 @@ public class BatchedExecutorMultiGuidance
                 MinP = DEFAULT_MIN_P,
                 RepeatPenalty = DEFAULT_REPEAT_PENALTY,
                 PenalizeNewline = false,
-                Grammar = handle
+                Grammar = handle                        // Update Grammar           // NEW: DEBUG
             },
 
             AntiPrompts = new List<string> { "Question:", "#", "Question: ", ".\n" },
@@ -637,7 +673,10 @@ public class BatchedExecutorMultiGuidance
             if (!string.IsNullOrEmpty(msg) && !msg.EndsWith(' '))
             {
                 var lastSpaceIndex = msg.LastIndexOf(" ");
-                msg = msg.Substring(0, lastSpaceIndex);
+                if (lastSpaceIndex != -1)                                   // NEW: DEBUG
+                {                                                           // NEW: DEBUG
+                    msg = msg.Substring(0, lastSpaceIndex);                 // NEW: DEBUG
+                }                                                           // NEW: DEBUG
             }
             var lines = msg.Split("\n").ToList();
             for(var index = 0; index < lines.Count; index++)
@@ -687,6 +726,10 @@ public class BatchedExecutorMultiGuidance
 
     private static async Task RunBatchedInference()
     {
+        // NEW: BEGIN DEBUG
+        var handle = GrammarParser.Instance.ParseGrammar("root ::= \"{\" ws01 root-answer \"}\" ws01\r\nroot-answer ::= \"\\\"answer\\\"\" \":\" ws01 string\r\n\r\n\r\nvalue  ::= (object | array | string | number | boolean | null) ws\r\n\r\nobject ::=\r\n  \"{\" ws (\r\n    string \":\" ws value\r\n    (\",\" ws string \":\" ws value)*\r\n  )? \"}\"\r\n\r\narray  ::=\r\n  \"[\" ws01 (\r\n            value\r\n    (\",\" ws01 value)*\r\n  )? \"]\"\r\n\r\nstring ::=\r\n  \"\\\"\" (string-char)* \"\\\"\"\r\n\r\nstring-char ::= [^\"\\\\] | \"\\\\\" ([\"\\\\/bfnrt] | \"u\" [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F]) # escapes\r\n\r\nnumber ::= integer (\".\" [0-9]+)? ([eE] [-+]? [0-9]+)?\r\ninteger ::= \"-\"? ([0-9] | [1-9] [0-9]*)\r\nboolean ::= \"true\" | \"false\"\r\nnull ::= \"null\"\r\n\r\n# Optional space: by convention, applied in this grammar after literal chars when allowed\r\nws ::= ([ \\t\\n] ws)?\r\nws01 ::= ([ \\t\\n])?");
+        // NEW: END DEBUG
+
         for (var tokenIndex = 0; (tokenIndex < MAX_CONVERSATION_TOKEN_COUNT) && !TotalBatchTokensReached && (errors.Count == 0); tokenIndex++)
         {
             for (var conversationIndex = 0; (conversationIndex < NUM_BATCHED_CONVERSATIONS) && !InferenceDecodeErrorFound && !TotalBatchTokensReached; conversationIndex++)
@@ -700,7 +743,14 @@ public class BatchedExecutorMultiGuidance
                     }
 
                     var currGuided = currStatus.Conversation;
-                    var currGuidedSampler = currStatus.SamplingPipeline as DefaultSamplingPipeline;
+
+                    // NEW: BEGIN DEBUG
+                    var currGuidedSampler = currStatus.SamplingPipeline as DefaultSamplingPipeline; // BatchedGrammarSamplerPipeline;     //DefaultSamplingPipeline;
+                    if (currGuidedSampler != null)
+                    {
+                        //currGuidedSampler.Grammar = handle;
+                    }
+                    // NEW: END DEBUG
                     var currGuidedDecoder = currStatus.StreamingTokenDecoder;
 
                     if ((currGuided == null) || (currGuidedSampler == null) || (currGuidedDecoder == null))
@@ -726,9 +776,17 @@ public class BatchedExecutorMultiGuidance
                     }
 
                     // Sample from the conversation.
-                    var currGuidedToken = currGuidedSampler.Sample(executor.Context.NativeHandle, currGuided.Sample(), []);
+
+                    // NEW: BEGIN DEBUG
+                    //var repeatLastN = currGuidedDecoder inferenceParams.RepeatLastTokensCount < 0 ? (int)Context.ContextSize : inferenceParams.RepeatLastTokensCount;
+                    //var lastTokens = currStatus.LastTokens.;
+                    var currGuidedToken = currGuidedSampler.Sample(executor.Context.NativeHandle, currGuided.Sample(), []);// currStatus.LastTokens.ToArray());
+                    currGuidedSampler.Accept(executor.Context.NativeHandle, currGuidedToken);       // <-- NEW: Added Accept() here...
+                    // NEW: END DEBUG
+
                     currGuidedDecoder.Add(currGuidedToken);     // Note: token is decoded and added to a list of characters.
                     currGuided.Prompt(currGuidedToken);
+                    //currStatus.LastTokens.Enqueue(currGuidedToken);
 
                     currStatus.NumTokens++;
                     BatchTokenCount++;
@@ -762,9 +820,239 @@ public class BatchedExecutorMultiGuidance
         timer.Stop();
     }
 
+#if _SKIP
+    #region BatchedGrammarSamplerPipeline
+    /// <summary>
+    /// An implementation of ISamplePipeline which mimics the default llama.cpp sampling pipeline.
+    /// </summary>
+    private class BatchedGrammarSamplerPipeline : BaseSamplingPipeline
+    {
+        private LLamaTokenData[]? _temporarySampling;  // temporary space
+
+        /// <inheritdoc/>
+        public LLamaToken Sample2(SafeLLamaContextHandle ctx, Span<float> logits, ReadOnlySpan<LLamaToken> lastTokens)
+        {
+            // Apply processing to raw logit values
+            ProcessLogits(ctx, logits, lastTokens);
+
+            // Allocate some temporary space
+            if (_temporarySampling == null || _temporarySampling.Length < logits.Length)
+                _temporarySampling = new LLamaTokenData[logits.Length];
+
+            // Process token data array to select a final token
+            var candidates = LLamaTokenDataArray.Create(logits, _temporarySampling);
+            candidates.ApplyGrammar(ctx, Grammar);
+#if !_SKIP
+            return ProcessTokenDataArray(ctx, candidates, lastTokens);
+#else
+            var token = ProcessTokenDataArray(ctx, candidates, default);
+            Accept(ctx, token);
+            return token;
+#endif
+        }
+
+
+        /// <summary>
+        /// Bias values to add to certain logits
+        /// </summary>
+        public Dictionary<LLamaToken, float> LogitBias { get; } = new();
+
+        /// <summary>
+        /// Repetition penalty, as described in https://arxiv.org/abs/1909.05858
+        /// </summary>
+        public float RepeatPenalty { get; set; }
+
+        /// <summary>
+        /// Frequency penalty as described by OpenAI: https://platform.openai.com/docs/api-reference/chat/create<br />
+        /// Number between -2.0 and 2.0. Positive values penalize new tokens based on their existing frequency in the text
+        /// so far, decreasing the model's likelihood to repeat the same line verbatim.
+        /// </summary>
+        public float AlphaFrequency
+        {
+            get => _alphaFreq;
+            set
+            {
+                if (value < -2)
+                    throw new ArgumentOutOfRangeException(nameof(value), "AlphaFrequency must be greater than -2");
+                if (value > 2)
+                    throw new ArgumentOutOfRangeException(nameof(value), "AlphaFrequency must be less than 2");
+                _alphaFreq = value;
+            }
+        }
+        private float _alphaFreq;
+
+        /// <summary>
+        /// Presence penalty as described by OpenAI: https://platform.openai.com/docs/api-reference/chat/create<br />
+        /// Number between -2.0 and 2.0. Positive values penalize new tokens based on whether they appear in the
+        /// text so far, increasing the model's likelihood to talk about new topics.
+        /// </summary>
+        public float AlphaPresence
+        {
+            get => _alphaPresence;
+            set
+            {
+                if (value < -2)
+                    throw new ArgumentOutOfRangeException(nameof(value), "AlphaFrequency must be greater than -2");
+                if (value > 2)
+                    throw new ArgumentOutOfRangeException(nameof(value), "AlphaFrequency must be less than 2");
+                _alphaPresence = value;
+            }
+        }
+        private float _alphaPresence;
+
+        /// <summary>
+        /// Temperature to apply (higher temperature is more "creative")
+        /// </summary>
+        public float Temperature { get; set; } = 0.75f;
+
+        /// <summary>
+        /// Number of tokens to keep in TopK sampling
+        /// </summary>
+        public int TopK { get; set; }
+
+        /// <summary>
+        /// Z value for tail free sampling
+        /// </summary>
+        public float TailFreeZ { get; set; }
+
+        /// <summary>
+        /// P value for locally typical sampling
+        /// </summary>
+        public float TypicalP { get; set; }
+
+        /// <summary>
+        /// P value for TopP sampling
+        /// </summary>
+        public float TopP { get; set; } = 1f;
+
+        /// <summary>
+        /// P value for MinP sampling
+        /// </summary>
+        public float MinP { get; set; }
+
+        /// <summary>
+        /// Whether the newline value should be protected from being modified by logit bias and repeat penalty
+        /// </summary>
+        public bool PenalizeNewline { get; set; } = false;
+
+        /// <inheritdoc />
+        protected override void ProcessLogits(SafeLLamaContextHandle ctx, Span<float> logits, ReadOnlySpan<LLamaToken> lastTokens)
+        {
+            // Apply logit bias
+            foreach (var (key, value) in LogitBias)
+                logits[(int)key] += value;
+
+        }
+
+        /// <inheritdoc />
+        protected override LLamaToken ProcessTokenDataArray(SafeLLamaContextHandle ctx, LLamaTokenDataArray candidates, ReadOnlySpan<LLamaToken> lastTokens)
+        {
+            // Only apply repetition penalty if we really must. Otherwise avoid all this work
+            if (lastTokens.Length > 0 && (RepeatPenalty != 0 || AlphaFrequency != 0 || AlphaPresence != 0))
+            {
+                // Save the logit value for the newline token
+                var (nlIndex, nlLogit) = PenalizeNewline ? GetNewlineLogit(ctx, candidates) : (-1, 0);
+
+                // Apply penalties to candidates
+                candidates.RepetitionPenalty(ctx, lastTokens, RepeatPenalty, AlphaFrequency, AlphaPresence);
+
+                // Restore newline token
+                if (!PenalizeNewline)
+                    SetNewlineLogit(ctx, candidates, nlIndex, nlLogit);
+            }
+
+            // Apply the normal llama.cpp pipeline
+            candidates.ApplyGrammar(ctx, Grammar);
+            candidates.TopK(ctx, TopK);
+            candidates.TailFree(ctx, TailFreeZ);
+            candidates.LocallyTypical(ctx, TypicalP);
+            candidates.TopP(ctx, TopP);
+            candidates.MinP(ctx, MinP);
+            candidates.Temperature(ctx, Temperature);
+            return candidates.SampleToken(ctx);
+        }
+
+        private static (int, float) GetNewlineLogit(SafeLLamaContextHandle ctx, LLamaTokenDataArray candidates)
+        {
+            var nlToken = ctx.ModelHandle.Tokens.Newline;
+
+            if (nlToken.HasValue)
+            {
+                // Try using the ID as an index
+                if (candidates.Data.Span[(int)nlToken].id == nlToken)
+                    return ((int)nlToken, candidates.Data.Span[(int)nlToken].logit);
+
+                // Exhaustive search
+                var span = candidates.Data.Span;
+                for (var i = 0; i < span.Length; i++)
+                {
+                    if (span[i].id == nlToken)
+                        return (i, span[i].logit);
+                }
+            }
+
+            return (-1, 0);
+        }
+
+        private static void SetNewlineLogit(SafeLLamaContextHandle ctx, LLamaTokenDataArray candidates, int indexHint, float logit)
+        {
+            var nlToken = ctx.ModelHandle.Tokens.Newline;
+            if (!nlToken.HasValue)
+                return;
+
+            // Try checking the index where we found it last time. It might not be there if `RepetitionPenalty` changed order
+            if (indexHint >= 0 && candidates.Data.Span[indexHint].id == nlToken)
+            {
+                candidates.Data.Span[indexHint].logit = logit;
+                return;
+            }
+
+            // Didn't find it, do an exhaustive search for it
+            var span = candidates.Data.Span;
+            for (var i = 0; i < candidates.Data.Length; i++)
+            {
+                if (span[i].id == nlToken)
+                {
+                    span[i].logit = logit;
+                    return;
+                }
+            }
+        }
+
+        /// <inheritdoc />
+        public override void Accept(SafeLLamaContextHandle ctx, LLamaToken token)
+        {
+            Grammar?.AcceptToken(ctx, token);
+        }
+
+        /// <inheritdoc />
+        public override ISamplingPipeline Clone()
+        {
+            var clone = new DefaultSamplingPipeline();
+
+            foreach (var (k, v) in LogitBias)
+                clone.LogitBias.Add(k, v);
+
+            clone.Grammar = Grammar?.Clone();
+            clone.RepeatPenalty = RepeatPenalty;
+            clone.AlphaFrequency = AlphaFrequency;
+            clone.AlphaPresence = AlphaPresence;
+            clone.Temperature = Temperature;
+            clone.TopK = TopK;
+            clone.TailFreeZ = TailFreeZ;
+            clone.TypicalP = TypicalP;
+            clone.TopP = TopP;
+            clone.MinP = MinP;
+            clone.PenalizeNewline = PenalizeNewline;
+
+            return clone;
+        }
+    }
+#endregion
+#endif
+
     #region GuidedSampler
-    private class GuidedSampler(Conversation guidance, float weight)
-        : BaseSamplingPipeline
+    private class GuidedSampler(Conversation guidance, float weight) : BaseSamplingPipeline
     {
         protected override LLamaToken ProcessTokenDataArray(SafeLLamaContextHandle ctx, LLamaTokenDataArray candidates, ReadOnlySpan<LLamaToken> lastTokens)
         {
