@@ -330,106 +330,6 @@ public class BatchedExecutorMultiGuidance
         AnsiConsole.WriteLine("DONE.");
     }
 
-    private static async Task Init()
-    {
-        AnsiConsole.WriteLine("BEGIN...");
-
-        // Load model weights
-        var parameters = new ModelParams(UserSettings.GetModelPath());
-        parameters.GpuLayerCount = 35;
-        //parameters.GpuLayerCount = 8;
-        //parameters.NoKqvOffload = true;
-        model ??= await LLamaWeights.LoadFromFileAsync(parameters);          // NEW: DEBUG
-
-        statelessExecutor = new StatelessExecutor(model, parameters);
-
-        //var positivePrompt = AnsiConsole.Ask("Positive Prompt (or ENTER for default):", "My favourite colour is").Trim();
-        //var negativePrompt = AnsiConsole.Ask("Negative Prompt (or ENTER for default):", "I hate the colour red. My favourite colour is").Trim();
-        var weight = AnsiConsole.Ask("Guidance Weight (or ENTER for default):", 2.0f);
-
-        // Create an executor that can evaluate a batch of conversations together
-        executor = new BatchedExecutor(model, parameters);
-
-        executor.Context.SaveState("SaveState");
-
-        // Print some info
-        var name = model.Metadata.GetValueOrDefault("general.name", "unknown model name");
-        Console.WriteLine($"Created executor with model: {name}");
-
-        // Load the two prompts into two conversations
-        //var guided = new List<Conversation>();
-        //var guidedSampler = new List<DefaultSamplingPipeline>();
-        //var guidedDecoder = new List<StreamingTokenDecoder>();
-        //var guidedInProgress = new HashSet<int>();
-        //var guidedNumTokens = new List<int>();
-
-        //var activeConversations = new Queue<InferenceResultData>();
-        mapConversationIdToInferenceData.Clear();
-
-        // Init Random number generator
-        new Random(questions.Length - 1);
-
-        for (var index = 0; index < NUM_BATCHED_CONVERSATIONS; index++)
-        {
-            //var promptIndex = index % questions.Length;
-            var promptIndex = random.RandomRange(0, questions.Length - 1);
-            var currPrompt = questions[promptIndex];
-
-            // NEW: DEBUG
-            // BEGIN NEW ////////////////////////////
-            var exampleJson = "**JSON FORMAT**\n{\"answer\":\"answer text\"}";
-            currPrompt = $"What is the capital of California? Reply using JSON.\n{exampleJson}";
-
-            // Keep track of the last N tokens emitted
-            //var repeatLastTokensCount = model.ContextSize;
-            //var repeat_last_n = repeatLastTokensCount; // Math.Max(0, inferenceParams.RepeatLastTokensCount < 0 ? _weights.ContextSize : inferenceParams.RepeatLastTokensCount);
-            //var lastTokens = new FixedSizeQueue<LLamaToken>(repeat_last_n);
-            //for (var i = 0; i < repeat_last_n; i++)
-            //{
-            //    lastTokens.Enqueue(0);
-            //}
-            // END NEW ////////////////////////////
-
-
-            var currGuided = executor.Create();
-
-            // NEW: DEBUG
-            // BEGIN NEW ////////////////////////////
-            var tokens = executor.Context.Tokenize(currPrompt);
-            //for(var i = 0; i < tokens.Length; i++)
-            //{
-            //    lastTokens.Enqueue(tokens[i]);
-            //}
-
-            currGuided.Prompt(tokens);
-
-            var handle = GrammarParser.Instance.ParseGrammar("root ::= \"{\" ws01 root-answer \"}\" ws01\r\nroot-answer ::= \"\\\"answer\\\"\" \":\" ws01 string\r\n\r\n\r\nvalue  ::= (object | array | string | number | boolean | null) ws\r\n\r\nobject ::=\r\n  \"{\" ws (\r\n    string \":\" ws value\r\n    (\",\" ws string \":\" ws value)*\r\n  )? \"}\"\r\n\r\narray  ::=\r\n  \"[\" ws01 (\r\n            value\r\n    (\",\" ws01 value)*\r\n  )? \"]\"\r\n\r\nstring ::=\r\n  \"\\\"\" (string-char)* \"\\\"\"\r\n\r\nstring-char ::= [^\"\\\\] | \"\\\\\" ([\"\\\\/bfnrt] | \"u\" [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F]) # escapes\r\n\r\nnumber ::= integer (\".\" [0-9]+)? ([eE] [-+]? [0-9]+)?\r\ninteger ::= \"-\"? ([0-9] | [1-9] [0-9]*)\r\nboolean ::= \"true\" | \"false\"\r\nnull ::= \"null\"\r\n\r\n# Optional space: by convention, applied in this grammar after literal chars when allowed\r\nws ::= ([ \\t\\n] ws)?\r\nws01 ::= ([ \\t\\n])?");
-            var samplingPipeline = new DefaultSamplingPipeline() //new GuidedSampler(currGuided, weight)  //DefaultSamplingPipeline()  //BatchedGrammarSamplerPipeline()    //DefaultSamplingPipeline()
-            // END NEW ////////////////////////////
-            {
-                //Temperature = DEFAULT_TEMPERATURE,
-                //PenalizeNewline = false,
-                //RepeatPenalty = DEFAULT_REPEAT_PENALTY,
-                //MinP = DEFAULT_MIN_P,
-                //TopP = DEFAULT_TOP_P,
-                //TopK = DEFAULT_TOP_K,                           // NEW: DEBUG
-                Grammar = handle            // update Grammar   // NEW: DEBUG
-            };
-            var streamingTokenDecoder = new StreamingTokenDecoder(executor.Context);
-
-            // Initialize the conversations that are active and the number of tokens they've received.
-            var currStatus = new InferenceResultData(index, MAX_CONVERSATION_TOKEN_COUNT, currPrompt, currGuided, samplingPipeline, streamingTokenDecoder);     // NEW: DEBUG
-            //currStatus.LastTokens = lastTokens;                                                                                                                 // NEW: DEBUG
-                                                                                                                                                                // NEW: DEBUG
-            mapConversationIdToInferenceData.Add(index, currStatus);                                                                                            // NEW: DEBUG
-        }
-
-        BatchTokenCount = 0; // guided and unguided.
-        timer.Restart();
-        decodeResult = DecodeResult.Ok;
-        errors.Clear();
-    }
-
     private static async Task<bool>Continue()
     {
         AnsiConsole.WriteLine("CONTINUE...");
@@ -693,7 +593,8 @@ public class BatchedExecutorMultiGuidance
             }
 
             AnsiConsole.MarkupLine($"[green]Guided: {conversationIndex}: {msg.Length} chars, {currStatus.NumTokens} tokens[/]");
-            AnsiConsole.WriteLine($"{msg}");
+            AnsiConsole.WriteLine($"UserMsg={currStatus.UserMsg}");
+            AnsiConsole.WriteLine($"msg={msg}");
         }
 
         var kvNumTokensInCache = executor.Context.NativeHandle.KvCacheCountTokens();
@@ -724,6 +625,106 @@ public class BatchedExecutorMultiGuidance
         //executor.Context.LoadState("SaveState");
     }
 
+    private static async Task Init()
+    {
+        AnsiConsole.WriteLine("BEGIN...");
+
+        // Load model weights
+        var parameters = new ModelParams(UserSettings.GetModelPath());
+        parameters.GpuLayerCount = 35;
+        //parameters.GpuLayerCount = 8;
+        //parameters.NoKqvOffload = true;
+        model ??= await LLamaWeights.LoadFromFileAsync(parameters);          // NEW: DEBUG
+
+        statelessExecutor = new StatelessExecutor(model, parameters);
+
+        //var positivePrompt = AnsiConsole.Ask("Positive Prompt (or ENTER for default):", "My favourite colour is").Trim();
+        //var negativePrompt = AnsiConsole.Ask("Negative Prompt (or ENTER for default):", "I hate the colour red. My favourite colour is").Trim();
+        var weight = AnsiConsole.Ask("Guidance Weight (or ENTER for default):", 2.0f);
+
+        // Create an executor that can evaluate a batch of conversations together
+        executor = new BatchedExecutor(model, parameters);
+
+        executor.Context.SaveState("SaveState");
+
+        // Print some info
+        var name = model.Metadata.GetValueOrDefault("general.name", "unknown model name");
+        Console.WriteLine($"Created executor with model: {name}");
+
+        // Load the two prompts into two conversations
+        //var guided = new List<Conversation>();
+        //var guidedSampler = new List<DefaultSamplingPipeline>();
+        //var guidedDecoder = new List<StreamingTokenDecoder>();
+        //var guidedInProgress = new HashSet<int>();
+        //var guidedNumTokens = new List<int>();
+
+        //var activeConversations = new Queue<InferenceResultData>();
+        mapConversationIdToInferenceData.Clear();
+
+        // Init Random number generator
+        new Random(questions.Length - 1);
+
+        for (var index = 0; index < NUM_BATCHED_CONVERSATIONS; index++)
+        {
+            //var promptIndex = index % questions.Length;
+            var promptIndex = random.RandomRange(0, questions.Length - 1);
+            var currPrompt = questions[promptIndex];
+
+            // NEW: DEBUG
+            // BEGIN NEW ////////////////////////////
+            var exampleJson = "**JSON FORMAT**\n{\"answer\":\"answer text\"}";
+            currPrompt = $"What is the capital of California? Reply using JSON.\n{exampleJson}";
+
+            // Keep track of the last N tokens emitted
+            //var repeatLastTokensCount = model.ContextSize;
+            //var repeat_last_n = repeatLastTokensCount; // Math.Max(0, inferenceParams.RepeatLastTokensCount < 0 ? _weights.ContextSize : inferenceParams.RepeatLastTokensCount);
+            //var lastTokens = new FixedSizeQueue<LLamaToken>(repeat_last_n);
+            //for (var i = 0; i < repeat_last_n; i++)
+            //{
+            //    lastTokens.Enqueue(0);
+            //}
+            // END NEW ////////////////////////////
+
+
+            var currGuided = executor.Create();
+
+            // NEW: DEBUG
+            // BEGIN NEW ////////////////////////////
+            var tokens = executor.Context.Tokenize(currPrompt);
+            //for(var i = 0; i < tokens.Length; i++)
+            //{
+            //    lastTokens.Enqueue(tokens[i]);
+            //}
+
+            currGuided.Prompt(tokens);
+
+            //var handle = GrammarParser.Instance.ParseGrammar("root ::= \"{\" ws01 root-answer \"}\" ws01\r\nroot-answer ::= \"\\\"answer\\\"\" \":\" ws01 string\r\n\r\n\r\nvalue  ::= (object | array | string | number | boolean | null) ws\r\n\r\nobject ::=\r\n  \"{\" ws (\r\n    string \":\" ws value\r\n    (\",\" ws string \":\" ws value)*\r\n  )? \"}\"\r\n\r\narray  ::=\r\n  \"[\" ws01 (\r\n            value\r\n    (\",\" ws01 value)*\r\n  )? \"]\"\r\n\r\nstring ::=\r\n  \"\\\"\" (string-char)* \"\\\"\"\r\n\r\nstring-char ::= [^\"\\\\] | \"\\\\\" ([\"\\\\/bfnrt] | \"u\" [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F]) # escapes\r\n\r\nnumber ::= integer (\".\" [0-9]+)? ([eE] [-+]? [0-9]+)?\r\ninteger ::= \"-\"? ([0-9] | [1-9] [0-9]*)\r\nboolean ::= \"true\" | \"false\"\r\nnull ::= \"null\"\r\n\r\n# Optional space: by convention, applied in this grammar after literal chars when allowed\r\nws ::= ([ \\t\\n] ws)?\r\nws01 ::= ([ \\t\\n])?");
+            var samplingPipeline = new DefaultSamplingPipeline() //new GuidedSampler(currGuided, weight)  //DefaultSamplingPipeline()  //BatchedGrammarSamplerPipeline()    //DefaultSamplingPipeline()
+            // END NEW ////////////////////////////
+            {
+                Temperature = DEFAULT_TEMPERATURE,
+                PenalizeNewline = false,
+                RepeatPenalty = DEFAULT_REPEAT_PENALTY,
+                MinP = DEFAULT_MIN_P,
+                TopP = DEFAULT_TOP_P,
+                TopK = DEFAULT_TOP_K,                           // NEW: DEBUG
+                //Grammar = handle            // update Grammar   // NEW: DEBUG
+            };
+            var streamingTokenDecoder = new StreamingTokenDecoder(executor.Context);
+
+            // Initialize the conversations that are active and the number of tokens they've received.
+            var currStatus = new InferenceResultData(index, MAX_CONVERSATION_TOKEN_COUNT, currPrompt, currGuided, samplingPipeline, streamingTokenDecoder);     // NEW: DEBUG
+                                                                                                                                                                //currStatus.LastTokens = lastTokens;                                                                                                                 // NEW: DEBUG
+                                                                                                                                                                // NEW: DEBUG
+            mapConversationIdToInferenceData.Add(index, currStatus);                                                                                            // NEW: DEBUG
+        }
+
+        BatchTokenCount = 0; // guided and unguided.
+        timer.Restart();
+        decodeResult = DecodeResult.Ok;
+        errors.Clear();
+    }
+
     private static async Task RunBatchedInference()
     {
         // NEW: BEGIN DEBUG
@@ -748,7 +749,7 @@ public class BatchedExecutorMultiGuidance
                     var currGuidedSampler = currStatus.SamplingPipeline as DefaultSamplingPipeline; // BatchedGrammarSamplerPipeline;     //DefaultSamplingPipeline;
                     if (currGuidedSampler != null)
                     {
-                        //currGuidedSampler.Grammar = handle;
+                        currGuidedSampler.Grammar = handle;
                     }
                     // NEW: END DEBUG
                     var currGuidedDecoder = currStatus.StreamingTokenDecoder;
@@ -782,6 +783,7 @@ public class BatchedExecutorMultiGuidance
                     //var lastTokens = currStatus.LastTokens.;
                     var currGuidedToken = currGuidedSampler.Sample(executor.Context.NativeHandle, currGuided.Sample(), []);// currStatus.LastTokens.ToArray());
                     currGuidedSampler.Accept(executor.Context.NativeHandle, currGuidedToken);       // <-- NEW: Added Accept() here...
+                    AnsiConsole.WriteLine($"{(int)currGuidedToken}");
                     // NEW: END DEBUG
 
                     currGuidedDecoder.Add(currGuidedToken);     // Note: token is decoded and added to a list of characters.
