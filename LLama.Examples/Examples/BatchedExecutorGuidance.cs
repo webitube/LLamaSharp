@@ -49,10 +49,14 @@ public class BatchedExecutorGuidance
         // Fork the "guided" conversation. We'll run this one without guidance for comparison
         using var unguided = guided.Fork();
 
+        var handle = GrammarParser.Instance.ParseGrammar("root ::= \"{\" ws01 root-answer \"}\" ws01\r\nroot-answer ::= \"\\\"answer\\\"\" \":\" ws01 string\r\n\r\n\r\nvalue  ::= (object | array | string | number | boolean | null) ws\r\n\r\nobject ::=\r\n  \"{\" ws (\r\n    string \":\" ws value\r\n    (\",\" ws string \":\" ws value)*\r\n  )? \"}\"\r\n\r\narray  ::=\r\n  \"[\" ws01 (\r\n            value\r\n    (\",\" ws01 value)*\r\n  )? \"]\"\r\n\r\nstring ::=\r\n  \"\\\"\" (string-char)* \"\\\"\"\r\n\r\nstring-char ::= [^\"\\\\] | \"\\\\\" ([\"\\\\/bfnrt] | \"u\" [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F]) # escapes\r\n\r\nnumber ::= integer (\".\" [0-9]+)? ([eE] [-+]? [0-9]+)?\r\ninteger ::= \"-\"? ([0-9] | [1-9] [0-9]*)\r\nboolean ::= \"true\" | \"false\"\r\nnull ::= \"null\"\r\n\r\n# Optional space: by convention, applied in this grammar after literal chars when allowed\r\nws ::= ([ \\t\\n] ws)?\r\nws01 ::= ([ \\t\\n])?");
+
         // Run inference loop
         var unguidedSampler = new DefaultSamplingPipeline();
         var unguidedDecoder = new StreamingTokenDecoder(executor.Context);
         var guidedSampler = new GuidedSampler(guidance, weight);
+        unguidedSampler.Grammar = handle;
+        guidedSampler.Grammar = handle;
         var guidedDecoder = new StreamingTokenDecoder(executor.Context);
         await AnsiConsole
            .Progress()
